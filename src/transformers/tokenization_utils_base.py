@@ -964,6 +964,150 @@ INIT_TOKENIZER_DOCSTRING = r"""
 """
 
 
+# Properties of an ``AddedToken`` record compared by ``PreTrainedTokenizerBase.diff_vocab``.
+# Kept in a fixed order so that the diff report is deterministic.
+_ADDED_TOKEN_DIFF_ATTRIBUTES = ("single_word", "lstrip", "rstrip", "normalized", "special")
+
+
+def _added_token_record(index: int, added_token: AddedToken) -> dict[str, Any]:
+    """Serialize a single `tokenizers.AddedToken` record into JSON-compatible data."""
+    record = {"id": int(index)}
+    for attribute in _ADDED_TOKEN_DIFF_ATTRIBUTES:
+        record[attribute] = bool(getattr(added_token, attribute))
+    return record
+
+
+def _added_token_records_by_content(tokenizer: PreTrainedTokenizerBase) -> dict[str, tuple[int, AddedToken]]:
+    """Index `added_tokens_decoder` by the raw `AddedToken.content` string.
+
+    The content is used as-is: there is no Unicode normalization or whitespace-marker replacement, and discontinuous
+    ids (as well as several tokens sharing the same id) are preserved.
+    """
+    records = {}
+    for index, added_token in tokenizer.added_tokens_decoder.items():
+        records[str(added_token)] = (int(index), added_token)
+    return records
+
+
+def _diff_vocab_maps(old_vocab: dict[str, int], new_vocab: dict[str, int]) -> dict[str, list[dict[str, Any]]]:
+    """Compare two full `token -> id` vocab maps by raw token string."""
+    old_tokens = set(old_vocab)
+    new_tokens = set(new_vocab)
+
+    added = [{"token": token, "new_id": int(new_vocab[token])} for token in sorted(new_tokens - old_tokens)]
+    removed = [{"token": token, "old_id": int(old_vocab[token])} for token in sorted(old_tokens - new_tokens)]
+    changed = []
+    for token in sorted(old_tokens & new_tokens):
+        old_id = int(old_vocab[token])
+        new_id = int(new_vocab[token])
+        if old_id != new_id:
+            changed.append({"token": token, "old_id": old_id, "new_id": new_id})
+
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+def _named_special_roles(tokenizer: PreTrainedTokenizerBase) -> dict[str, str | None]:
+    """Raw token string of every named special role (including model-specific custom roles)."""
+    roles = {}
+    for role in getattr(tokenizer, "SPECIAL_TOKENS_ATTRIBUTES", []):
+        token = tokenizer._special_tokens_map.get(role)
+        roles[role] = None if token is None else str(token)
+    return roles
+
+
+def _diff_special_roles(
+    old_tokenizer: PreTrainedTokenizerBase,
+    new_tokenizer: PreTrainedTokenizerBase,
+    old_vocab: dict[str, int],
+    new_vocab: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Compare named special role assignments (bos_token, eos_token, pad_token, custom roles, ...)."""
+    old_roles = _named_special_roles(old_tokenizer)
+    new_roles = _named_special_roles(new_tokenizer)
+
+    diffs = []
+    for role in sorted(set(old_roles) | set(new_roles)):
+        old_token = old_roles.get(role)
+        new_token = new_roles.get(role)
+        # Ids are looked up in the already-loaded vocab maps only: this never performs text encoding.
+        old_id = None if old_token is None or old_token not in old_vocab else int(old_vocab[old_token])
+        new_id = None if new_token is None or new_token not in new_vocab else int(new_vocab[new_token])
+        if old_token != new_token or old_id != new_id:
+            diffs.append(
+                {
+                    "role": role,
+                    "old_token": old_token,
+                    "old_id": old_id,
+                    "new_token": new_token,
+                    "new_id": new_id,
+                }
+            )
+    return diffs
+
+
+def _extra_special_token_strings(tokenizer: PreTrainedTokenizerBase) -> list[str]:
+    return [str(token) for token in getattr(tokenizer, "_extra_special_tokens", [])]
+
+
+def _diff_extra_special_tokens(old_tokens: list[str], new_tokens: list[str]) -> dict[str, Any]:
+    """Compare the ordered extra special token lists by content and relative order."""
+    old_token_set = set(old_tokens)
+    new_token_set = set(new_tokens)
+    # Relative order of the tokens present on both sides (duplicates removed for the ordering check).
+    old_order = list(dict.fromkeys(token for token in old_tokens if token in new_token_set))
+    new_order = list(dict.fromkeys(token for token in new_tokens if token in old_token_set))
+
+    return {
+        "old": list(old_tokens),
+        "new": list(new_tokens),
+        "added": sorted(new_token_set - old_token_set),
+        "removed": sorted(old_token_set - new_token_set),
+        "reordered": old_order != new_order,
+    }
+
+
+def _diff_added_tokens(
+    old_tokenizer: PreTrainedTokenizerBase, new_tokenizer: PreTrainedTokenizerBase
+) -> dict[str, list[dict[str, Any]]]:
+    """Compare `AddedToken` records (existence and the single_word/lstrip/rstrip/normalized/special properties)."""
+    old_records = _added_token_records_by_content(old_tokenizer)
+    new_records = _added_token_records_by_content(new_tokenizer)
+    old_contents = set(old_records)
+    new_contents = set(new_records)
+
+    added = []
+    for content in sorted(new_contents - old_contents):
+        index, added_token = new_records[content]
+        added.append({"token": content, "old": None, "new": _added_token_record(index, added_token)})
+
+    removed = []
+    for content in sorted(old_contents - new_contents):
+        index, added_token = old_records[content]
+        removed.append({"token": content, "old": _added_token_record(index, added_token), "new": None})
+
+    changed = []
+    for content in sorted(old_contents & new_contents):
+        old_index, old_added_token = old_records[content]
+        new_index, new_added_token = new_records[content]
+        attribute_changes = {}
+        for attribute in _ADDED_TOKEN_DIFF_ATTRIBUTES:
+            old_value = bool(getattr(old_added_token, attribute))
+            new_value = bool(getattr(new_added_token, attribute))
+            if old_value != new_value:
+                attribute_changes[attribute] = {"old": old_value, "new": new_value}
+        if attribute_changes:
+            changed.append(
+                {
+                    "token": content,
+                    "old": _added_token_record(old_index, old_added_token),
+                    "new": _added_token_record(new_index, new_added_token),
+                    "attribute_changes": attribute_changes,
+                }
+            )
+
+    return {"added": added, "removed": removed, "changed": changed}
+
+
 @add_end_docstrings(INIT_TOKENIZER_DOCSTRING)
 class PreTrainedTokenizerBase(PushToHubMixin):
     """
@@ -1461,6 +1605,89 @@ class PreTrainedTokenizerBase(PushToHubMixin):
             `dict[str, int]`: The vocabulary.
         """
         raise NotImplementedError()
+
+    def diff_vocab(self, new_tokenizer: PreTrainedTokenizerBase) -> dict[str, Any]:
+        """
+        Compare the vocabulary and the vocabulary-level metadata of two already-loaded tokenizers.
+
+        `self` is treated as the old version and `new_tokenizer` as the new version. The returned report is a plain
+        Python data structure that can be serialized directly with `json.dumps` (it only contains strings, integers,
+        booleans, lists, dictionaries and `None`).
+
+        Tokens are matched by their **raw token strings**, exactly as stored by the tokenizers: there is no Unicode
+        normalization, case folding or whitespace-marker replacement (e.g. `"Ġhello"` and `" hello"` are two different
+        tokens). Discontinuous ids and several token strings sharing the same id are supported. The order in which the
+        backends iterate over their vocab dictionaries is ignored; every list of entries in the report is sorted either
+        by token string or by role name.
+
+        The report contains four sections:
+
+        - `"vocab"` compares the full `token -> id` maps returned by `get_vocab()`:
+          - `"added"`: tokens only present in the new tokenizer, each with its `"new_id"`,
+          - `"removed"`: tokens only present in the old tokenizer, each with its `"old_id"`,
+          - `"changed"`: tokens present in both with different ids, each with `"old_id"` and `"new_id"`.
+        - `"special_token_roles"` lists, for every named role present on either side (`bos_token`, `eos_token`,
+          `pad_token`, ..., including model-specific custom roles), the role token and id on each side. A side that
+          does not define the role reports `None` for its `"old_token"`/`"old_id"`/`"new_token"`/`"new_id"`. Only
+          roles that changed are listed.
+        - `"extra_special_tokens"` compares the ordered extra special token lists (content and order): `"old"`/`"new"`
+          are the two lists, `"added"`/`"removed"` list token strings missing on one side, and `"reordered"` is `True`
+          when the shared tokens appear in a different relative order.
+        - `"added_tokens"` compares the `AddedToken` records keyed by token content: `"added"`/`"removed"` entries
+          carry the full record (id plus `single_word`, `lstrip`, `rstrip`, `normalized`, `special`) of the existing
+          side as `"new"` or `"old"`, with the missing side set to `None`, and `"changed"` entries report every
+          modified property under `"attribute_changes"`.
+
+        This is a strictly read-only comparison: it only reads `get_vocab()`, `added_tokens_decoder` and the
+        special-token metadata of both tokenizers. It never encodes text, downloads anything, loads a model,
+        renumbers tokens or modifies either tokenizer, and comparing a tokenizer with itself returns an empty report.
+
+        <Tip warning={true}>
+
+        The report only describes whether the vocabulary and the `AddedToken` metadata above are consistent. It does
+        **not** compare normalizers, pre-tokenization, post-processing or the tokenization algorithm, and an empty
+        report must not be used to claim that both tokenizers encode arbitrary text identically.
+
+        </Tip>
+
+        Args:
+            new_tokenizer ([`PreTrainedTokenizerBase`]):
+                The tokenizer considered as the new version; `self` is considered as the old version.
+
+        Returns:
+            `dict[str, Any]`: The structured, JSON-serializable vocabulary diff report described above.
+
+        Examples:
+
+        ```python
+        from transformers import AutoTokenizer
+
+        old_tokenizer = AutoTokenizer.from_pretrained("old-model", local_files_only=True)
+        new_tokenizer = AutoTokenizer.from_pretrained("new-model", local_files_only=True)
+        report = old_tokenizer.diff_vocab(new_tokenizer)
+
+        import json
+
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        ```
+        """
+        if not isinstance(new_tokenizer, PreTrainedTokenizerBase):
+            raise TypeError(
+                "diff_vocab expects another PreTrainedTokenizerBase instance to compare against, got "
+                f"{type(new_tokenizer)}."
+            )
+
+        old_vocab = self.get_vocab()
+        new_vocab = new_tokenizer.get_vocab()
+
+        return {
+            "vocab": _diff_vocab_maps(old_vocab, new_vocab),
+            "special_token_roles": _diff_special_roles(self, new_tokenizer, old_vocab, new_vocab),
+            "extra_special_tokens": _diff_extra_special_tokens(
+                _extra_special_token_strings(self), _extra_special_token_strings(new_tokenizer)
+            ),
+            "added_tokens": _diff_added_tokens(self, new_tokenizer),
+        }
 
     def convert_tokens_to_ids(self, tokens: str | list[str]) -> int | list[int]:
         """
