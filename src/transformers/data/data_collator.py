@@ -211,6 +211,14 @@ class DataCollatorWithPadding:
 
             This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
             7.0 (Volta).
+        padding_lengths (`list[int]`, *optional*):
+            A strictly increasing list of unique positive integers defining the allowed padded sequence lengths. For
+            each batch, the smallest length in the list that is not smaller than the longest sequence in the batch is
+            used as the padding length (e.g. with `[64, 128, 256]`, a batch whose longest sequence has 65 tokens is
+            padded to 128). This limits the number of distinct tensor shapes produced when training or running
+            inference on dynamic-length inputs. Sequences are never truncated: if the longest sequence is longer than
+            the largest configured length, an error is raised. When set, `padding` must be `True` or `'longest'`,
+            and `max_length` and `pad_to_multiple_of` must not be set.
         return_tensors (`str`, *optional*, defaults to `"pt"`):
             The type of Tensor to return. Allowable values are "np", or "pt".
     """
@@ -219,15 +227,60 @@ class DataCollatorWithPadding:
     padding: bool | str | PaddingStrategy = True
     max_length: int | None = None
     pad_to_multiple_of: int | None = None
+    padding_lengths: list[int] | None = None
     return_tensors: str = "pt"
 
+    def __post_init__(self):
+        if self.padding_lengths is None:
+            return
+
+        if not isinstance(self.padding_lengths, list) or len(self.padding_lengths) == 0:
+            raise ValueError(
+                f"`padding_lengths` should be a non-empty list of positive integers, got {self.padding_lengths}."
+            )
+        if not all(
+            isinstance(length, int) and not isinstance(length, bool) and length > 0 for length in self.padding_lengths
+        ):
+            raise ValueError(f"`padding_lengths` should only contain positive integers, got {self.padding_lengths}.")
+        if any(previous >= current for previous, current in zip(self.padding_lengths, self.padding_lengths[1:])):
+            raise ValueError(
+                "`padding_lengths` should be strictly increasing and contain no duplicates, got "
+                f"{self.padding_lengths}."
+            )
+        if not (self.padding is True or self.padding == "longest" or self.padding == PaddingStrategy.LONGEST):
+            raise ValueError(
+                f"`padding_lengths` can only be used with `padding=True` or `padding='longest'`, got {self.padding}."
+            )
+        if self.max_length is not None or self.pad_to_multiple_of is not None:
+            raise ValueError("`padding_lengths` cannot be used together with `max_length` or `pad_to_multiple_of`.")
+
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        padding = self.padding
+        max_length = self.max_length
+        pad_to_multiple_of = self.pad_to_multiple_of
+
+        if self.padding_lengths is not None:
+            longest_feature_length = max(len(feature["input_ids"]) for feature in features)
+            padding_length = next(
+                (length for length in self.padding_lengths if length >= longest_feature_length),
+                None,
+            )
+            if padding_length is None:
+                raise ValueError(
+                    f"The longest sequence in the batch has {longest_feature_length} tokens, which is longer than "
+                    f"the largest configured padding length ({self.padding_lengths[-1]}). Sequences are not "
+                    "truncated when using `padding_lengths`; please add a larger length to the list."
+                )
+            padding = PaddingStrategy.MAX_LENGTH
+            max_length = padding_length
+            pad_to_multiple_of = None
+
         batch = pad_without_fast_tokenizer_warning(
             self.tokenizer,
             features,
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
+            padding=padding,
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
             return_tensors=self.return_tensors,
         )
         if "label" in batch:

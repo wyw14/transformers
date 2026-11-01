@@ -308,6 +308,210 @@ class TestDataCollatorWithPadding(DataCollatorTestMixin, unittest.TestCase):
 
         self.assertEqual(batch["attention_mask"].shape, torch.Size([batch_size, 1, q_len, kv_len]))
 
+    # -------------------- padding_lengths (length buckets) --------------------
+
+    def test_padding_lengths_pads_to_smallest_fitting_bucket(self):
+        """Each batch is padded to the smallest configured length that fits its longest sequence."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        features = [
+            {"input_ids": [0, 1, 2]},
+            {"input_ids": [0, 1, 2, 3, 4]},  # batch max length: 5
+        ]
+
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16])
+        batch = collator(features)
+
+        # 5 fits into 8, so every sequence is padded to 8 (not 16 and not the batch max of 5).
+        self.assertEqual(batch["input_ids"].shape, torch.Size([2, 8]))
+        pad_id = tokenizer.pad_token_id
+        self.assertEqual(batch["input_ids"][0].tolist(), [0, 1, 2] + [pad_id] * 5)
+        self.assertEqual(batch["input_ids"][1].tolist(), [0, 1, 2, 3, 4] + [pad_id] * 3)
+        self.assertEqual(batch["attention_mask"][0].tolist(), [1, 1, 1, 0, 0, 0, 0, 0])
+        self.assertEqual(batch["attention_mask"][1].tolist(), [1, 1, 1, 1, 1, 0, 0, 0])
+
+        # The exact example from the specification: max length 65 with [64, 128, 256] -> 128.
+        features = [{"input_ids": [0] * 60}, {"input_ids": [0] * 65}]
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[64, 128, 256])
+        batch = collator(features)
+        self.assertEqual(batch["input_ids"].shape, torch.Size([2, 128]))
+
+    def test_padding_lengths_exact_boundary(self):
+        """A batch max length exactly equal to a bucket uses that bucket without extra padding."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16])
+
+        for batch_max_length, expected_length in [(4, 4), (8, 8), (16, 16), (9, 16), (3, 4)]:
+            features = [{"input_ids": [0] * 2}, {"input_ids": [0] * batch_max_length}]
+            batch = collator(features)
+            self.assertEqual(
+                batch["input_ids"].shape,
+                torch.Size([2, expected_length]),
+                msg=f"batch max length {batch_max_length} should pad to {expected_length}",
+            )
+
+    def test_padding_lengths_exceeding_largest_bucket_raises(self):
+        """A batch longer than the largest bucket raises instead of truncating."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        features = [{"input_ids": [0] * 2}, {"input_ids": list(range(17))}]
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16])
+
+        with self.assertRaises(ValueError):
+            collator(features)
+
+        # Inputs must be left untouched (no truncation) after the failed call.
+        self.assertEqual(len(features[1]["input_ids"]), 17)
+        self.assertEqual(features[1]["input_ids"], list(range(17)))
+
+    def test_padding_lengths_respects_left_padding_side(self):
+        """Buckets honor the tokenizer's left padding convention for ids and attention masks."""
+        tokenizer = BertTokenizer(self.vocab_file, padding_side="left")
+        self.assertEqual(tokenizer.padding_side, "left")
+        features = [
+            {"input_ids": [0, 1, 2]},
+            {"input_ids": [0, 1, 2, 3, 4]},  # batch max length: 5
+        ]
+
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16])
+        batch = collator(features)
+
+        self.assertEqual(batch["input_ids"].shape, torch.Size([2, 8]))
+        pad_id = tokenizer.pad_token_id
+        self.assertEqual(batch["input_ids"][0].tolist(), [pad_id] * 5 + [0, 1, 2])
+        self.assertEqual(batch["input_ids"][1].tolist(), [pad_id] * 3 + [0, 1, 2, 3, 4])
+        self.assertEqual(batch["attention_mask"][0].tolist(), [0, 0, 0, 0, 0, 1, 1, 1])
+        self.assertEqual(batch["attention_mask"][1].tolist(), [0, 0, 0, 1, 1, 1, 1, 1])
+
+    def test_padding_lengths_single_feature_batch(self):
+        """A batch containing a single feature is also padded to the fitting bucket."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16])
+
+        batch = collator([{"input_ids": [0, 1, 2]}])
+        self.assertEqual(batch["input_ids"].shape, torch.Size([1, 4]))
+        self.assertEqual(batch["input_ids"][0].tolist(), [0, 1, 2, tokenizer.pad_token_id])
+
+        # An exact fit requires no padding.
+        batch = collator([{"input_ids": [0, 1, 2, 3]}])
+        self.assertEqual(batch["input_ids"].shape, torch.Size([1, 4]))
+        self.assertEqual(batch["input_ids"][0].tolist(), [0, 1, 2, 3])
+
+        with self.assertRaises(ValueError):
+            collator([{"input_ids": [0] * 17}])
+
+    def test_padding_lengths_numpy_output(self):
+        """Buckets work with NumPy return tensors."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        features = [{"input_ids": [0, 1, 2]}, {"input_ids": [0, 1, 2, 3, 4]}]
+
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16], return_tensors="np")
+        batch = collator(features)
+
+        self.assertIsInstance(batch["input_ids"], np.ndarray)
+        self.assertEqual(batch["input_ids"].shape, (2, 8))
+        self.assertEqual(batch["input_ids"][0].tolist(), [0, 1, 2] + [tokenizer.pad_token_id] * 5)
+        self.assertIsInstance(batch["attention_mask"], np.ndarray)
+
+    def test_padding_lengths_with_tensor_inputs(self):
+        """Buckets work when features carry PyTorch tensors and do not mutate them."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        features = [
+            {"input_ids": torch.tensor([0, 1, 2])},
+            {"input_ids": torch.tensor([0, 1, 2, 3, 4])},
+        ]
+
+        collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16])
+        batch = collator(features)
+
+        self.assertEqual(batch["input_ids"].shape, torch.Size([2, 8]))
+        self.assertEqual(batch["input_ids"].dtype, torch.long)
+        self.assertEqual(features[0]["input_ids"].tolist(), [0, 1, 2])
+        self.assertEqual(features[1]["input_ids"].tolist(), [0, 1, 2, 3, 4])
+
+    def test_padding_lengths_label_renaming(self):
+        """The `label`/`label_ids` -> `labels` renaming is preserved with buckets."""
+        tokenizer = BertTokenizer(self.vocab_file)
+
+        # Singular `label`
+        features = [
+            {"input_ids": [0, 1, 2], "label": 7},
+            {"input_ids": [0, 1, 2, 3, 4], "label": 8},
+        ]
+        batch = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8])(features)
+        self.assertNotIn("label", batch)
+        self.assertEqual(batch["labels"].tolist(), [7, 8])
+        self.assertEqual(batch["input_ids"].shape, torch.Size([2, 8]))
+
+        # `label_ids` of equal length across the batch
+        features = [
+            {"input_ids": [0, 1, 2], "label_ids": [10, 11]},
+            {"input_ids": [0, 1, 2, 3, 4], "label_ids": [12, 13]},
+        ]
+        batch = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8])(features)
+        self.assertNotIn("label_ids", batch)
+        self.assertEqual(batch["labels"].tolist(), [[10, 11], [12, 13]])
+
+    def test_padding_lengths_immutability(self):
+        """Bucket padding must not mutate the input feature list or its features."""
+        tokenizer = BertTokenizer(self.vocab_file)
+
+        for return_tensors in ["pt", "np"]:
+            collator = DataCollatorWithPadding(tokenizer, padding_lengths=[4, 8, 16], return_tensors=return_tensors)
+            features = [
+                {"input_ids": [0, 1, 2]},
+                {"input_ids": [0, 1, 2, 3, 4]},
+            ]
+            self._check_immutability(collator, features)
+            self.assertEqual(len(features), 2)
+
+    def test_padding_lengths_invalid_configurations_raise(self):
+        """Invalid bucket lists are rejected at construction time."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        invalid_padding_lengths = [
+            [],  # empty
+            [128, 64, 256],  # not sorted
+            [64, 64, 128],  # duplicates
+            [64.0, 128],  # floats
+            ["64", 128],  # non-integer entry
+            [0, 64],  # zero is not positive
+            [-1, 64],  # negative entry
+            [True, 64],  # booleans are not accepted as integers
+            (64, 128),  # only a list is accepted
+        ]
+
+        for padding_lengths in invalid_padding_lengths:
+            with self.subTest(padding_lengths=padding_lengths):
+                with self.assertRaises(ValueError):
+                    DataCollatorWithPadding(tokenizer, padding_lengths=padding_lengths)
+
+    def test_padding_lengths_incompatible_arguments_raise(self):
+        """Buckets only combine with dynamic padding and cannot set max_length/pad_to_multiple_of."""
+        tokenizer = BertTokenizer(self.vocab_file)
+
+        for padding in ["max_length", PaddingStrategy.MAX_LENGTH, False, "do_not_pad"]:
+            with self.subTest(padding=padding):
+                with self.assertRaises(ValueError):
+                    DataCollatorWithPadding(tokenizer, padding=padding, padding_lengths=[64, 128])
+
+        with self.assertRaises(ValueError):
+            DataCollatorWithPadding(tokenizer, padding=True, max_length=128, padding_lengths=[64, 128])
+
+        with self.assertRaises(ValueError):
+            DataCollatorWithPadding(tokenizer, padding="longest", pad_to_multiple_of=8, padding_lengths=[64, 128])
+
+    def test_padding_lengths_accepts_longest_variants_and_without_buckets_unchanged(self):
+        """`True`, `'longest'` and `PaddingStrategy.LONGEST` are accepted; no buckets keeps old behavior."""
+        tokenizer = BertTokenizer(self.vocab_file)
+        features = [{"input_ids": [0, 1, 2]}, {"input_ids": [0, 1, 2, 3, 4]}]
+
+        for padding in [True, "longest", PaddingStrategy.LONGEST]:
+            collator = DataCollatorWithPadding(tokenizer, padding=padding, padding_lengths=[4, 8])
+            batch = collator(features)
+            self.assertEqual(batch["input_ids"].shape, torch.Size([2, 8]))
+
+        # Without `padding_lengths`, padding stays dynamic at the batch max length (5 here).
+        batch = DataCollatorWithPadding(tokenizer)(features)
+        self.assertEqual(batch["input_ids"].shape, torch.Size([2, 5]))
+
 
 # =============================================================================
 # DataCollatorWithFlattening tests
