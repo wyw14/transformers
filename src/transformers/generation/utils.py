@@ -116,6 +116,7 @@ from .stopping_criteria import (
     StoppingCriteria,
     StoppingCriteriaList,
     StopStringCriteria,
+    SurpriseBudgetCriteria,
 )
 
 
@@ -2982,6 +2983,25 @@ class GenerationMixin(ContinuousMixin):
             tokenizer=generation_mode_kwargs.get("tokenizer"),
         )
 
+        # `SurpriseBudgetCriteria` accumulates per-token surprise from the scores of the actual selection
+        # distribution: it can only be trusted with one-token-at-a-time greedy/sampling decoding and with the
+        # per-step scores enabled.
+        if any(isinstance(criterion, SurpriseBudgetCriteria) for criterion in prepared_stopping_criteria):
+            if generation_mode not in (GenerationMode.GREEDY_SEARCH, GenerationMode.SAMPLE):
+                raise ValueError(
+                    "`SurpriseBudgetCriteria` only supports greedy decoding and multinomial sampling "
+                    "(`num_beams=1`, without an assistant model or prompt-lookup decoding). Beam search, beam "
+                    "sampling, assisted generation, constrained/group beam search, contrastive search and DoLa "
+                    "either reorder the candidate sequences or accept several tokens at once, so their per-step "
+                    "scores cannot be aligned with the selected tokens to compute a reliable cumulative surprise."
+                )
+            if not (generation_config.output_scores and generation_config.return_dict_in_generate):
+                raise ValueError(
+                    "`SurpriseBudgetCriteria` requires the per-step selection scores, but they are not "
+                    "available. Pass `output_scores=True` and `return_dict_in_generate=True` to `generate` "
+                    "(`output_scores` is ignored unless `return_dict_in_generate` is also enabled)."
+                )
+
         # Set model_kwargs `use_cache` so we can use it later in forward runs
         model_kwargs["use_cache"] = generation_config.use_cache
 
@@ -3266,7 +3286,12 @@ class GenerationMixin(ContinuousMixin):
                 # update generated ids, model inputs, and length for next step
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
 
-                unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+                # Pass the liveness mask from before this step, so that score-based criteria (e.g.
+                # `SurpriseBudgetCriteria`) can skip rows that already ended in a previous step and are now only
+                # being extended with padding tokens.
+                unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+                    input_ids, scores, unfinished_sequences=unfinished_sequences
+                )
                 this_peer_finished = stop_check(unfinished_sequences, next_tokens, input_ids.shape[1])
 
                 # This is needed to properly delete outputs.logits which may be very large for first iteration

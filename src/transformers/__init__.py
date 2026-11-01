@@ -406,6 +406,7 @@ else:
             "StopStringCriteria",
             "SuppressTokensAtBeginLogitsProcessor",
             "SuppressTokensLogitsProcessor",
+            "SurpriseBudgetCriteria",
             "SynthIDTextWatermarkDetector",
             "SynthIDTextWatermarkingConfig",
             "SynthIDTextWatermarkLogitsProcessor",
@@ -550,6 +551,7 @@ if TYPE_CHECKING:
     from .generation import StopStringCriteria as StopStringCriteria
     from .generation import SuppressTokensAtBeginLogitsProcessor as SuppressTokensAtBeginLogitsProcessor
     from .generation import SuppressTokensLogitsProcessor as SuppressTokensLogitsProcessor
+    from .generation import SurpriseBudgetCriteria as SurpriseBudgetCriteria
     from .generation import SynthIDTextWatermarkDetector as SynthIDTextWatermarkDetector
     from .generation import SynthIDTextWatermarkingConfig as SynthIDTextWatermarkingConfig
     from .generation import SynthIDTextWatermarkLogitsProcessor as SynthIDTextWatermarkLogitsProcessor

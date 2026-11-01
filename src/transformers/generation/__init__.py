@@ -84,6 +84,7 @@ else:
         "EosTokenCriteria",
         "StoppingCriteria",
         "StoppingCriteriaList",
+        "SurpriseBudgetCriteria",
         "validate_stopping_criteria",
         "StopStringCriteria",
     ]
@@ -191,6 +192,7 @@ if TYPE_CHECKING:
             StoppingCriteria,
             StoppingCriteriaList,
             StopStringCriteria,
+            SurpriseBudgetCriteria,
             validate_stopping_criteria,
         )
         from .utils import (

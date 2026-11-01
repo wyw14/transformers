@@ -1,4 +1,5 @@
 import json
+import math
 import time
 import warnings
 from abc import ABC
@@ -613,6 +614,247 @@ class ConfidenceCriteria(StoppingCriteria):
         if p < self.assistant_confidence_threshold:
             return True
         return False
+
+
+class SurpriseBudgetCriteria(StoppingCriteria):
+    """
+    This class can be used to stop generation whenever the cumulative "surprise" of the generated tokens reaches a
+    budget. The surprise of a token is defined as `-log(p)`, where `p` is the normalized probability of the selected
+    token under the distribution it was actually picked from (greedy `argmax` or multinomial sampling). At every
+    generation step, the newly generated token's surprise is added to that row's cumulative surprise, and the row is
+    marked as finished as soon as the cumulative value reaches `surprise_budget` and at least `minimum_new_tokens`
+    have been generated.
+
+    Only tokens generated in the current generation call count towards the budget (the prompt is never counted) and
+    each row of the batch is tracked independently. Once a row stops (either through this criteria or another one,
+    such as the EOS criteria), the padding tokens appended afterwards do not accumulate any surprise.
+
+    The probabilities are computed with a log-softmax, which keeps the computation numerically stable even for
+    extremely small probabilities. This criteria only supports greedy decoding and multinomial sampling
+    (`num_beams=1`, without an assistant model or prompt-lookup decoding): beam search reorders the candidate
+    sequences and assisted generation can accept several tokens at once, so their per-step scores cannot be aligned
+    with the selected tokens reliably. Generation must be run with both `output_scores=True` and
+    `return_dict_in_generate=True` so that the per-step selection scores are passed to this criteria.
+
+    An instance of this criteria keeps state across calls (the cumulative surprise and the generated history). To
+    reuse the same instance for a new generation session, call [`~SurpriseBudgetCriteria.reset`] first.
+
+    Args:
+        surprise_budget (`float`):
+            The non-negative finite budget of cumulative surprise (in nats) that a generated sequence is allowed to
+            reach. Generation for a row stops as soon as the sum of `-log(p)` of its generated tokens is greater
+            than or equal to this value.
+        minimum_new_tokens (`int`, *optional*, defaults to 0):
+            The minimum number of tokens that must be generated for a row before it is allowed to stop due to the
+            surprise budget. The surprise keeps being accumulated in the meantime.
+
+    Examples:
+
+    ```python
+    >>> from transformers import AutoModelForCausalLM, AutoTokenizer
+    >>> from transformers.generation import StoppingCriteriaList, SurpriseBudgetCriteria
+
+    >>> tokenizer = AutoTokenizer.from_pretrained("my-model")
+    >>> model = AutoModelForCausalLM.from_pretrained("my-model")
+    >>> inputs = tokenizer("The weather today is", return_tensors="pt")
+
+    >>> # Stop once the generated tokens accumulate 5 nats of surprise -- but not before 10 tokens are generated
+    >>> stopping_criteria = StoppingCriteriaList([SurpriseBudgetCriteria(5.0, minimum_new_tokens=10)])
+    >>> gen_out = model.generate(
+    ...     **inputs,
+    ...     stopping_criteria=stopping_criteria,
+    ...     output_scores=True,
+    ...     return_dict_in_generate=True,
+    ... )
+    ```
+    """
+
+    def __init__(self, surprise_budget: float, minimum_new_tokens: int = 0):
+        surprise_budget = float(surprise_budget)
+        if not math.isfinite(surprise_budget) or surprise_budget < 0:
+            raise ValueError(f"`surprise_budget` has to be a non-negative finite number, but is {surprise_budget}.")
+        if not isinstance(minimum_new_tokens, int) or isinstance(minimum_new_tokens, bool):
+            raise ValueError(f"`minimum_new_tokens` has to be a non-negative integer, but is {minimum_new_tokens}.")
+        if minimum_new_tokens < 0:
+            raise ValueError(f"`minimum_new_tokens` has to be a non-negative integer, but is {minimum_new_tokens}.")
+
+        self.surprise_budget = surprise_budget
+        self.minimum_new_tokens = minimum_new_tokens
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        self._prompt_length: int | None = None
+        self._last_length: int | None = None
+        self._batch_size: int | None = None
+        self._last_input_ids: torch.LongTensor | None = None
+        self._cumulative_surprise: torch.FloatTensor | None = None
+        self._is_done: torch.BoolTensor | None = None
+
+    def reset(self) -> None:
+        """
+        Resets the internal state of this criteria, so that the same instance can be reused in a new generation
+        session.
+        """
+        self._reset_state()
+
+    @property
+    def cumulative_surprise(self) -> torch.FloatTensor | None:
+        """The cumulative surprise of each row at the latest generation step, or `None` before the first call."""
+        return self._cumulative_surprise
+
+    @add_start_docstrings(STOPPING_CRITERIA_INPUTS_DOCSTRING)
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: tuple[torch.FloatTensor] | None,
+        unfinished_sequences: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> torch.BoolTensor:
+        if scores is None:
+            raise ValueError(
+                f"{self.__class__.__name__} needs the per-step generation scores, but `None` was passed. Pass "
+                "both `output_scores=True` and `return_dict_in_generate=True` when calling `generate` (the "
+                "former is ignored unless the latter is set)."
+            )
+        if not isinstance(scores, tuple) or len(scores) == 0 or not isinstance(scores[-1], torch.Tensor):
+            raise ValueError(
+                f"{self.__class__.__name__} expects `scores` to be a non-empty tuple containing one score tensor "
+                f"per generation step, but got {scores!r}."
+            )
+        if input_ids.dim() != 2:
+            raise ValueError(
+                f"{self.__class__.__name__} expects `input_ids` to have shape (batch_size, sequence_length), but "
+                f"got a tensor of shape {tuple(input_ids.shape)}."
+            )
+
+        cur_len = input_ids.shape[1]
+        batch_size = input_ids.shape[0]
+        step_scores = scores[-1]
+        if step_scores.dim() != 2 or step_scores.shape[0] != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects the latest score tensor to have shape (batch_size, "
+                f"vocab_size), but got {tuple(step_scores.shape)} for a batch of size {batch_size}."
+            )
+
+        selected_tokens = input_ids[:, -1]
+        if torch.any(selected_tokens >= step_scores.shape[-1]):
+            raise ValueError(
+                "The latest generated token is outside the vocabulary of the latest score tensor; the generation "
+                "history and the scores cannot be aligned."
+            )
+
+        if self._prompt_length is None:
+            # In supported decoding modes, exactly one token has been generated (and one score step recorded) when
+            # the criteria is called for the first time. Anything else is a mode we cannot account for (e.g.
+            # assisted generation accepting several candidate tokens on its first iteration).
+            if len(scores) != 1 or cur_len < 1:
+                raise ValueError(
+                    f"{self.__class__.__name__} expects exactly one generated token and one step of scores on its "
+                    f"first call (as in greedy/sampling decoding), but got {cur_len} tokens and {len(scores)} "
+                    "score steps. This criteria does not support assisted generation or beam search."
+                )
+            self._prompt_length = cur_len - 1
+            self._last_length = cur_len
+            self._batch_size = batch_size
+            self._last_input_ids = input_ids
+            self._cumulative_surprise = torch.zeros(batch_size, device=input_ids.device, dtype=torch.float32)
+            self._is_done = torch.zeros(batch_size, device=input_ids.device, dtype=torch.bool)
+        else:
+            last_length = self._last_length
+            last_input_ids = self._last_input_ids
+            if last_length is None or last_input_ids is None:
+                raise ValueError(
+                    f"{self.__class__.__name__} is in an inconsistent state: it was called before but no history "
+                    "was recorded. Build a new instance or call `reset()` before starting a generation session."
+                )
+            if batch_size != self._batch_size:
+                raise ValueError(
+                    f"The batch size changed from {self._batch_size} to {batch_size} between calls to "
+                    f"{self.__class__.__name__}. Call `reset()` before reusing this criteria instance for a new "
+                    "generation session."
+                )
+
+            num_appended_tokens = cur_len - last_length
+            if num_appended_tokens > 1:
+                raise ValueError(
+                    f"{self.__class__.__name__} expects exactly one new token per call, but "
+                    f"{num_appended_tokens} tokens were appended since the previous call. Several tokens being "
+                    "accepted at once is characteristic of assisted generation, which is not supported because "
+                    "the accepted draft tokens were not sampled from the target model's distribution."
+                )
+            if num_appended_tokens != 1:
+                raise ValueError(
+                    f"{self.__class__.__name__} expects the generated history to grow by exactly one token on "
+                    f"each call, but its length went from {last_length} to {cur_len}. If you want to reuse this "
+                    "criteria instance for a new generation session, call `reset()` first."
+                )
+
+            # In greedy/sampling decoding the history only grows by appending. A rewritten or reordered history
+            # means another decoding strategy is driving the generation (e.g. beam search reordering the beams).
+            if not torch.equal(input_ids[:, :-1], last_input_ids):
+                raise ValueError(
+                    "The generated history was rewritten or reordered between two calls, so the per-step scores "
+                    f"cannot be aligned with the selected tokens. This is not supported by {self.__class__.__name__}"
+                    " (it happens with beam search, which reorders the candidate sequences between steps)."
+                )
+
+            self._last_length = cur_len
+            self._last_input_ids = input_ids
+
+        prompt_length = self._prompt_length
+        cumulative_surprise = self._cumulative_surprise
+        is_done = self._is_done
+        if prompt_length is None or cumulative_surprise is None or is_done is None:
+            raise ValueError(
+                f"{self.__class__.__name__} is in an inconsistent state after initialization. Build a new "
+                "instance or call `reset()` before starting a generation session."
+            )
+
+        num_generated_tokens = cur_len - prompt_length
+        if num_generated_tokens != len(scores):
+            raise ValueError(
+                f"The generated history ({num_generated_tokens} new tokens) and the per-step scores "
+                f"({len(scores)} steps) cannot be aligned. Make sure the same `scores` tuple built by `generate` "
+                "is passed at every call."
+            )
+
+        # Normalize the scores of the actual selection distribution in log-space: `log_softmax` is shift-invariant
+        # and avoids underflowing to zero for extremely small probabilities.
+        log_probs = F.log_softmax(step_scores.to(dtype=torch.float32), dim=-1)
+        token_log_probs = log_probs.gather(dim=-1, index=selected_tokens[:, None].to(torch.long)).squeeze(-1)
+        step_surprise = -token_log_probs
+
+        if cumulative_surprise.device != step_surprise.device:
+            cumulative_surprise = cumulative_surprise.to(step_surprise.device)
+            is_done = is_done.to(step_surprise.device)
+
+        # Rows that have already finished (flagged either by this criteria or by an external liveness mask, e.g.
+        # EOS) do not accumulate surprise for the padding tokens that are appended in subsequent steps.
+        active = ~is_done
+        if unfinished_sequences is not None:
+            if unfinished_sequences.dim() != 1 or unfinished_sequences.shape[0] != batch_size:
+                raise ValueError(
+                    f"{self.__class__.__name__} expects `unfinished_sequences` to have shape ({batch_size},), but "
+                    f"got {tuple(unfinished_sequences.shape)}."
+                )
+            active = active & unfinished_sequences.to(device=is_done.device).bool()
+
+        if torch.any(torch.isnan(step_surprise) & active):
+            raise ValueError(
+                "The selection distribution of one or more active rows is degenerate (every token has zero "
+                "probability), so the selected token's surprise cannot be computed. Please adjust the logits "
+                "processors (e.g. enable `InfNanRemoveLogitsProcessor`)."
+            )
+
+        cumulative_surprise = cumulative_surprise + step_surprise * active
+
+        reached_budget = cumulative_surprise >= self.surprise_budget
+        past_minimum_length = num_generated_tokens >= self.minimum_new_tokens
+        is_done = is_done | (reached_budget & past_minimum_length)
+
+        self._cumulative_surprise = cumulative_surprise
+        self._is_done = is_done
+        return is_done.clone()
 
 
 class StoppingCriteriaList(list):

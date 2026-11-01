@@ -196,6 +196,10 @@ A [`StoppingCriteria`] can be used to change when to stop generation (other than
 [[autodoc]] EosTokenCriteria
     - __call__
 
+[[autodoc]] SurpriseBudgetCriteria
+    - __call__
+    - reset
+
 ## Streamers
 
 [[autodoc]] TextStreamer

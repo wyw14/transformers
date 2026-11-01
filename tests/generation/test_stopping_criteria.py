@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import time
 import unittest
 
@@ -31,6 +32,7 @@ if is_torch_available():
         MaxTimeCriteria,
         StoppingCriteriaList,
         StopStringCriteria,
+        SurpriseBudgetCriteria,
         validate_stopping_criteria,
     )
     from transformers.generation.stopping_criteria import STOP_STRING_EMBEDDING_CACHE
@@ -408,3 +410,468 @@ class StoppingCriteriaTestCase(unittest.TestCase):
 
         # False when neither is satisfied
         self.assertListEqual(criteria(inputs["input_ids"][:, :-1], scores).tolist(), [False, False, False])
+
+    def _run_surprise_step(self, criteria, input_ids, scores, new_tokens, step_logits, unfinished=None):
+        """Mimics one greedy/sampling generation step: append a token, record the step scores, call the criteria."""
+        input_ids = torch.cat([input_ids, new_tokens[:, None].to(input_ids.device)], dim=-1)
+        scores = scores + (step_logits,)
+        kwargs = {}
+        if unfinished is not None:
+            kwargs["unfinished_sequences"] = unfinished
+        is_done = criteria(input_ids, scores, **kwargs)
+        return input_ids, scores, is_done
+
+    def _probs_to_logits(self, probs):
+        # `log(p)` are valid logits: softmax(log(p)) == p when the rows of `probs` sum to 1.
+        return torch.log(probs.to(torch_device))
+
+    def test_surprise_budget_criteria_invalid_args(self):
+        for invalid_budget in (-1.0, float("inf"), float("-inf"), float("nan")):
+            with self.assertRaises(ValueError):
+                SurpriseBudgetCriteria(surprise_budget=invalid_budget)
+        for invalid_minimum in (-1, 1.5, True):
+            with self.assertRaises(ValueError):
+                SurpriseBudgetCriteria(surprise_budget=1.0, minimum_new_tokens=invalid_minimum)
+
+    def test_surprise_budget_criteria_cumulative_values(self):
+        # Single row, 3-token prompt; fixed selection distributions for 4 generated tokens.
+        vocab_size = 4
+        prompt_length = 3
+        input_ids = torch.randint(0, vocab_size, (1, prompt_length), device=torch_device)
+        step_probs = [
+            torch.tensor([[0.5, 0.5, 0.0, 0.0]]),
+            torch.tensor([[0.25, 0.25, 0.25, 0.25]]),
+            torch.tensor([[0.1, 0.2, 0.3, 0.4]]),
+            torch.tensor([[0.1, 0.2, 0.3, 0.4]]),
+        ]
+        selected_tokens = [0, 1, 2, 3]
+        expected_surprises = [-math.log([0.5, 0.25, 0.3, 0.4][i]) for i in range(4)]
+
+        criteria = SurpriseBudgetCriteria(surprise_budget=100.0)  # never triggers here
+        scores = ()
+        for step, (probs, token) in enumerate(zip(step_probs, selected_tokens)):
+            new_tokens = torch.tensor([token], device=torch_device)
+            input_ids, scores, is_done = self._run_surprise_step(
+                criteria, input_ids, scores, new_tokens, self._probs_to_logits(probs)
+            )
+            self.assertFalse(is_done.any())
+            torch.testing.assert_close(
+                criteria.cumulative_surprise.cpu(),
+                torch.tensor([sum(expected_surprises[: step + 1])], dtype=torch.float32),
+                rtol=1e-5,
+                atol=1e-6,
+            )
+
+        # The prompt itself must never be counted: 4 score steps <=> 4 generated tokens.
+        self.assertEqual(input_ids.shape[1] - prompt_length, len(scores))
+
+    def test_surprise_budget_criteria_threshold_boundary(self):
+        vocab_size = 4
+        probs = torch.tensor([[0.5, 0.5, 0.0, 0.0]])
+        per_token_surprise = float(-torch.log(torch.tensor(0.5)))
+
+        # Budget exactly matching the first token's surprise: stop as soon as the budget is *reached*.
+        criteria = SurpriseBudgetCriteria(surprise_budget=per_token_surprise)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        _, _, is_done = self._run_surprise_step(
+            criteria, input_ids, (), torch.tensor([0]), self._probs_to_logits(probs)
+        )
+        self.assertTrue(bool(is_done[0]))
+
+        # An epsilon of room: do not stop after one token, stop once the second token reaches the budget.
+        criteria = SurpriseBudgetCriteria(surprise_budget=per_token_surprise + 1e-4)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        scores = ()
+        input_ids, scores, is_done = self._run_surprise_step(
+            criteria, input_ids, scores, torch.tensor([0]), self._probs_to_logits(probs)
+        )
+        self.assertFalse(bool(is_done[0]))
+        _, _, is_done = self._run_surprise_step(
+            criteria, input_ids, scores, torch.tensor([1]), self._probs_to_logits(probs)
+        )
+        self.assertTrue(bool(is_done[0]))
+
+        # Zero budget with zero minimum tokens stops at the first generated token (surprise is non-negative).
+        criteria = SurpriseBudgetCriteria(surprise_budget=0.0)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        _, _, is_done = self._run_surprise_step(
+            criteria, input_ids, (), torch.tensor([0]), self._probs_to_logits(probs)
+        )
+        self.assertTrue(bool(is_done[0]))
+
+    def test_surprise_budget_criteria_minimum_new_tokens(self):
+        vocab_size = 4
+        probs = torch.tensor([[0.5, 0.5, 0.0, 0.0]])
+        per_token_surprise = float(-torch.log(torch.tensor(0.5)))
+        criteria = SurpriseBudgetCriteria(surprise_budget=per_token_surprise - 1e-4, minimum_new_tokens=3)
+
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        scores = ()
+        done_per_step = []
+        for _ in range(4):
+            input_ids, scores, is_done = self._run_surprise_step(
+                criteria, input_ids, scores, torch.tensor([0], device=torch_device), self._probs_to_logits(probs)
+            )
+            done_per_step.append(bool(is_done[0]))
+
+        # Budget is reached on the first token, but stopping is deferred until `minimum_new_tokens` exist.
+        self.assertListEqual(done_per_step, [False, False, True, True])
+        # The row latches at step 3; the tokens appended afterwards are not accumulated.
+        torch.testing.assert_close(
+            criteria.cumulative_surprise.cpu(),
+            torch.tensor([3 * per_token_surprise], dtype=torch.float32),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    def test_surprise_budget_criteria_batched_independent(self):
+        # 3 rows, each selecting tokens of fixed probability.
+        row_probs = torch.tensor([0.5, 0.25, 0.1], device=torch_device)
+        vocab_size = 6
+        criteria = SurpriseBudgetCriteria(surprise_budget=2.0)
+
+        input_ids = torch.randint(0, vocab_size, (3, 2), device=torch_device)
+        scores = ()
+        stop_steps = [None, None, None]
+        for step in range(1, 6):
+            step_logits = torch.zeros(3, vocab_size, device=torch_device)
+            # Token 0 gets the row-specific probability, the remaining mass is spread uniformly.
+            step_logits[:, 0] = torch.log(row_probs)
+            step_logits[:, 1:] = torch.log((1 - row_probs) / (vocab_size - 1))[:, None]
+            input_ids, scores, is_done = self._run_surprise_step(
+                criteria, input_ids, scores, torch.zeros(3, dtype=torch.long, device=torch_device), step_logits
+            )
+            for row in range(3):
+                if stop_steps[row] is None and bool(is_done[row]):
+                    stop_steps[row] = step
+
+        # Rows with lower-probability tokens (higher surprise) stop earlier, independently.
+        self.assertListEqual(stop_steps, [3, 2, 1])
+
+        # A stopped row must not accumulate the padding tokens appended afterwards: the cumulative value is the
+        # value it had when the row stopped.
+        frozen_cumulative = -torch.log(row_probs).cpu() * torch.tensor(stop_steps, dtype=torch.float32)
+        torch.testing.assert_close(criteria.cumulative_surprise.cpu(), frozen_cumulative, rtol=1e-5, atol=1e-6)
+
+    def test_surprise_budget_criteria_skips_externally_finished_rows(self):
+        # Simulate row 0 hitting EOS before step 2: the liveness mask marks it inactive, and the padding token
+        # appended at step 2 must not be accumulated nor flag the row through this criteria.
+        vocab_size = 4
+        probs = torch.tensor([[0.5, 0.5, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0]])
+        criteria = SurpriseBudgetCriteria(surprise_budget=100.0)
+
+        input_ids = torch.randint(0, vocab_size, (2, 1), device=torch_device)
+        scores = ()
+        input_ids, scores, _ = self._run_surprise_step(
+            criteria,
+            input_ids,
+            scores,
+            torch.tensor([0, 0]),
+            self._probs_to_logits(probs),
+            unfinished=torch.ones(2, dtype=torch.long),
+        )
+        cumulative_after_step_1 = criteria.cumulative_surprise.clone()
+
+        # Padding tokens for the finished row 0 would look extremely "surprising" -- they still must be ignored.
+        pad_logits = torch.full((2, vocab_size), -100.0, device=torch_device)
+        input_ids, scores, is_done = self._run_surprise_step(
+            criteria,
+            input_ids,
+            scores,
+            torch.tensor([0, 1]),  # token appended to both rows; row 0 is padding in a real generation
+            pad_logits,
+            unfinished=torch.tensor([0, 1]),
+        )
+        self.assertFalse(bool(is_done[0]))
+        torch.testing.assert_close(
+            criteria.cumulative_surprise[0].cpu(), cumulative_after_step_1[0].cpu(), rtol=1e-5, atol=1e-6
+        )
+        self.assertGreater(float(criteria.cumulative_surprise[1]), float(cumulative_after_step_1[1]))
+
+    def test_surprise_budget_criteria_stable_for_tiny_probabilities(self):
+        vocab_size = 4
+        # A probability so small that plain softmax underflows to zero, but log_softmax stays finite.
+        step_logits = torch.tensor([[0.0, -1000.0, -1000.0, -1000.0]], device=torch_device)
+        self.assertEqual(float(torch.softmax(step_logits, dim=-1)[0, 1]), 0.0)
+
+        criteria = SurpriseBudgetCriteria(surprise_budget=10_000.0)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        _, _, is_done = self._run_surprise_step(criteria, input_ids, (), torch.tensor([1]), step_logits)
+        self.assertFalse(bool(is_done[0]))
+        self.assertTrue(torch.isfinite(criteria.cumulative_surprise).all())
+        torch.testing.assert_close(criteria.cumulative_surprise.cpu(), torch.tensor([1000.0]), rtol=1e-6, atol=1e-4)
+
+        # A token with exactly zero probability yields infinite surprise and stops immediately against a finite
+        # budget, without producing NaNs.
+        step_logits = torch.tensor([[0.0, float("-inf"), float("-inf"), float("-inf")]], device=torch_device)
+        criteria = SurpriseBudgetCriteria(surprise_budget=1.0)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        _, _, is_done = self._run_surprise_step(criteria, input_ids, (), torch.tensor([1]), step_logits)
+        self.assertTrue(bool(is_done[0]))
+        self.assertTrue(torch.isinf(criteria.cumulative_surprise).all())
+        self.assertFalse(torch.isnan(criteria.cumulative_surprise).any())
+
+    def test_surprise_budget_criteria_degenerate_distribution_raises(self):
+        vocab_size = 4
+        step_logits = torch.full((1, vocab_size), float("-inf"), device=torch_device)
+        criteria = SurpriseBudgetCriteria(surprise_budget=1.0)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        with self.assertRaises(ValueError):
+            self._run_surprise_step(criteria, input_ids, (), torch.tensor([0]), step_logits)
+
+    def test_surprise_budget_criteria_scores_required(self):
+        criteria = SurpriseBudgetCriteria(surprise_budget=1.0)
+        input_ids = torch.randint(0, 4, (1, 2), device=torch_device)
+        with self.assertRaises(ValueError):
+            criteria(input_ids, None)
+
+    def test_surprise_budget_criteria_multi_token_step_raises(self):
+        # Assisted generation can accept several candidate tokens in one iteration.
+        vocab_size = 4
+        criteria = SurpriseBudgetCriteria(surprise_budget=100.0)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        first_logits = torch.zeros(1, vocab_size, device=torch_device)
+        input_ids, scores, _ = self._run_surprise_step(criteria, input_ids, (), torch.tensor([0]), first_logits)
+        input_ids = torch.cat([input_ids, torch.tensor([[1, 2]], device=torch_device)], dim=-1)
+        scores = scores + (first_logits, first_logits)
+        with self.assertRaises(ValueError):
+            criteria(input_ids, scores)
+
+    def test_surprise_budget_criteria_reordered_history_raises(self):
+        # Beam search can reorder/rewrite the rows between steps.
+        vocab_size = 4
+        criteria = SurpriseBudgetCriteria(surprise_budget=100.0)
+        input_ids = torch.tensor([[3, 0]], device=torch_device)
+        first_logits = torch.zeros(1, vocab_size, device=torch_device)
+        input_ids, scores, _ = self._run_surprise_step(criteria, input_ids, (), torch.tensor([1]), first_logits)
+        reordered = torch.tensor([[3, 2, 1]], device=torch_device)  # prefix token 0 was rewritten into 2
+        with self.assertRaises(ValueError):
+            criteria(reordered, scores + (first_logits,))
+
+    def test_surprise_budget_criteria_misaligned_scores_raise(self):
+        vocab_size = 4
+        criteria = SurpriseBudgetCriteria(surprise_budget=100.0)
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        first_logits = torch.zeros(1, vocab_size, device=torch_device)
+        input_ids, scores, _ = self._run_surprise_step(
+            criteria, input_ids, (), torch.tensor([0], device=torch_device), first_logits
+        )
+        # One more token is appended (so the history grows by exactly one), but the scores tuple has an extra
+        # step that the generated history cannot be aligned with.
+        input_ids = torch.cat([input_ids, torch.tensor([[1]], device=torch_device)], dim=-1)
+        with self.assertRaises(ValueError):
+            criteria(input_ids, scores + (first_logits, first_logits))
+
+    def test_surprise_budget_criteria_batch_change_raises(self):
+        vocab_size = 4
+        criteria = SurpriseBudgetCriteria(surprise_budget=100.0)
+        input_ids = torch.randint(0, vocab_size, (2, 1), device=torch_device)
+        first_logits = torch.zeros(2, vocab_size, device=torch_device)
+        self._run_surprise_step(criteria, input_ids, (), torch.tensor([0, 1]), first_logits)
+
+        new_input_ids = torch.randint(0, vocab_size, (3, 1), device=torch_device)
+        new_logits = torch.zeros(3, vocab_size, device=torch_device)
+        with self.assertRaises(ValueError):
+            self._run_surprise_step(criteria, new_input_ids, (), torch.tensor([0, 1, 2]), new_logits)
+
+    def test_surprise_budget_criteria_reset(self):
+        vocab_size = 4
+        criteria = SurpriseBudgetCriteria(surprise_budget=100.0)
+        self.assertIsNone(criteria.cumulative_surprise)
+
+        input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        first_logits = torch.zeros(1, vocab_size, device=torch_device)
+        self._run_surprise_step(criteria, input_ids, (), torch.tensor([0]), first_logits)
+        self.assertIsNotNone(criteria.cumulative_surprise)
+
+        # Reusing the instance for a new short session without resetting fails on the history check.
+        fresh_input_ids = torch.randint(0, vocab_size, (1, 1), device=torch_device)
+        with self.assertRaises(ValueError):
+            self._run_surprise_step(criteria, fresh_input_ids, (), torch.tensor([0]), first_logits)
+
+        # After `reset`, a new session starts from a clean state.
+        criteria.reset()
+        self.assertIsNone(criteria.cumulative_surprise)
+        self._run_surprise_step(criteria, fresh_input_ids, (), torch.tensor([0]), first_logits)
+        self.assertIsNotNone(criteria.cumulative_surprise)
+
+    def test_surprise_budget_criteria_in_generate_greedy(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        torch.manual_seed(0)
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+        )
+        model = LlamaForCausalLM(config).to(torch_device).eval()
+        model.generation_config.eos_token_id = None
+        model.generation_config.pad_token_id = None
+        input_ids = torch.randint(1, config.vocab_size, (1, 3), device=torch_device)
+
+        # First pass: let greedy decoding run to the maximum length and record the cumulative surprise series.
+        full_output = model.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=20,
+            output_scores=True,
+            return_dict_in_generate=True,
+            stopping_criteria=[SurpriseBudgetCriteria(surprise_budget=1e9)],
+        )
+        generated = full_output.sequences[0, input_ids.shape[1] :]
+        cumulative = []
+        running = 0.0
+        for step, token in enumerate(generated):
+            log_prob = torch.log_softmax(full_output.scores[step][0].to(torch.float32), dim=-1)[token]
+            running += float(-log_prob)
+            cumulative.append(running)
+        self.assertEqual(len(cumulative), 20)
+
+        # Second pass: set the budget exactly to the cumulative value after an interior token. Greedy decoding is
+        # deterministic, so generation must stop at exactly that step (budget is reached with `>=`).
+        stop_step = 4
+        budget = cumulative[stop_step - 1]
+        self.assertLess(cumulative[stop_step - 2], budget)  # the previous step must still be below the budget
+
+        criteria = SurpriseBudgetCriteria(surprise_budget=budget)
+        output = model.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=20,
+            output_scores=True,
+            return_dict_in_generate=True,
+            stopping_criteria=[criteria],
+        )
+        self.assertEqual(output.sequences.shape[1], input_ids.shape[1] + stop_step)
+        self.assertEqual(len(output.scores), stop_step)
+        torch.testing.assert_close(
+            criteria.cumulative_surprise.cpu(),
+            torch.tensor([budget], dtype=torch.float32),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    def test_surprise_budget_criteria_in_generate_unsupported_modes(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        torch.manual_seed(0)
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+        )
+        model = LlamaForCausalLM(config).to(torch_device).eval()
+        model.generation_config.pad_token_id = None
+        input_ids = torch.randint(1, config.vocab_size, (1, 3), device=torch_device)
+
+        # Beam search is not supported.
+        with self.assertRaises(ValueError):
+            model.generate(
+                input_ids,
+                num_beams=2,
+                max_new_tokens=5,
+                output_scores=True,
+                return_dict_in_generate=True,
+                stopping_criteria=[SurpriseBudgetCriteria(surprise_budget=1.0)],
+            )
+
+        # Assisted generation is not supported.
+        with self.assertRaises(ValueError):
+            model.generate(
+                input_ids,
+                max_new_tokens=5,
+                output_scores=True,
+                return_dict_in_generate=True,
+                assistant_model=model,
+                stopping_criteria=[SurpriseBudgetCriteria(surprise_budget=1.0)],
+            )
+
+        # Per-step scores must be enabled (`output_scores` is ignored without `return_dict_in_generate`).
+        with self.assertRaises(ValueError):
+            model.generate(
+                input_ids,
+                do_sample=False,
+                max_new_tokens=5,
+                stopping_criteria=[SurpriseBudgetCriteria(surprise_budget=1.0)],
+            )
+        with self.assertRaises(ValueError):
+            model.generate(
+                input_ids,
+                do_sample=False,
+                max_new_tokens=5,
+                output_scores=True,
+                stopping_criteria=[SurpriseBudgetCriteria(surprise_budget=1.0)],
+            )
+
+    def test_surprise_budget_criteria_in_generate_sampling_and_reset(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        torch.manual_seed(0)
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+        )
+        model = LlamaForCausalLM(config).to(torch_device).eval()
+        model.generation_config.eos_token_id = None
+        model.generation_config.pad_token_id = None
+        input_ids = torch.randint(1, config.vocab_size, (1, 3), device=torch_device)
+
+        # First sampled pass (with a fixed RNG seed) records the cumulative surprise series.
+        torch.manual_seed(123)
+        full_output = model.generate(
+            input_ids,
+            do_sample=True,
+            max_new_tokens=20,
+            output_scores=True,
+            return_dict_in_generate=True,
+            stopping_criteria=[SurpriseBudgetCriteria(surprise_budget=1e9)],
+        )
+        generated = full_output.sequences[0, input_ids.shape[1] :]
+        cumulative = []
+        running = 0.0
+        for step, token in enumerate(generated):
+            log_prob = torch.log_softmax(full_output.scores[step][0].to(torch.float32), dim=-1)[token]
+            running += float(-log_prob)
+            cumulative.append(running)
+
+        # Second pass with the same RNG seed: sampling reproduces the same tokens, and the exact budget boundary
+        # stops it at the expected step, while `minimum_new_tokens` is respected.
+        stop_step = 3
+        budget = cumulative[stop_step - 1]
+        criteria = SurpriseBudgetCriteria(surprise_budget=budget, minimum_new_tokens=2)
+        torch.manual_seed(123)
+        output = model.generate(
+            input_ids,
+            do_sample=True,
+            max_new_tokens=20,
+            output_scores=True,
+            return_dict_in_generate=True,
+            stopping_criteria=[criteria],
+        )
+        self.assertEqual(output.sequences.shape[1], input_ids.shape[1] + stop_step)
+        self.assertTrue(torch.all(criteria.cumulative_surprise >= budget))
+
+        # The same instance can serve a new session after `reset`.
+        criteria.reset()
+        output_again = model.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=20,
+            output_scores=True,
+            return_dict_in_generate=True,
+            stopping_criteria=[criteria],
+        )
+        self.assertLessEqual(output_again.sequences.shape[1] - input_ids.shape[1], 20)
