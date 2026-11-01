@@ -272,6 +272,11 @@ class TrainingArguments:
             optimizer step. Prevents gradient explosion by scaling down gradients when their global
             norm exceeds this threshold. Set to 0 to disable clipping. Typical values:
             1.0 (standard), 0.5 (more conservative), 5.0 (less aggressive).
+
+            To clip different optimizer parameter groups with different thresholds, set a
+            `max_grad_norm` entry directly in the corresponding optimizer parameter group dict.
+            Groups without that entry keep using this value; `0` disables clipping for that group
+            only. The logged `grad_norm` is always the combined pre-clipping norm over all groups.
         label_smoothing_factor (`float`, *optional*, defaults to 0.0):
             Label smoothing factor to prevent overconfidence. Replaces hard 0/1 targets with soft
             targets: 0 becomes `ε/num_labels` and 1 becomes `1 - ε + ε/num_labels`, where

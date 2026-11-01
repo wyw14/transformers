@@ -186,6 +186,11 @@ from .utils.quantization_config import QuantizationMethod
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
 
+# Optional key in an optimizer parameter group dict to override `TrainingArguments.max_grad_norm`
+# for that group only. Omit the key to inherit the global value; set it to 0 to skip clipping for
+# the group. See `Trainer._clip_grad_norm_per_param_group`.
+PARAM_GROUP_MAX_GRAD_NORM_KEY = "max_grad_norm"
+
 if is_in_notebook():
     from .utils.notebook import NotebookProgressCallback
 
@@ -323,7 +328,9 @@ class Trainer:
             If you want to remove one of the default callbacks used, use the [`Trainer.remove_callback`] method.
         optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`, *optional*, defaults to `(None, None)`):
             A tuple containing the optimizer and the scheduler to use. Will default to an instance of [`AdamW`] on your
-            model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
+            model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`. Parameter groups may
+            set their own non-negative `max_grad_norm` to clip that group independently; `0` skips clipping for the
+            group and an omitted key falls back to `TrainingArguments.max_grad_norm`.
         optimizer_cls_and_kwargs (`tuple[Type[torch.optim.Optimizer], dict[str, Any]]`, *optional*):
             A tuple containing the optimizer class and keyword arguments to use.
             Overrides `optim` and `optim_args` in `args`. Incompatible with the `optimizers` argument.
@@ -629,6 +636,8 @@ class Trainer:
         self._created_lr_scheduler = False
         # Resolved lazily at the first gradient clip; see `_has_mixed_mesh_grads`.
         self._mixed_mesh_grads: bool | None = None
+        # Validated lazily at the first gradient clip; see `_validate_per_param_group_grad_norms`.
+        self._per_param_group_grad_norms_validated = False
         if (
             self.is_distributed_loading_by_transformers
             and args.save_strategy != SaveStrategy.NO
@@ -1264,6 +1273,8 @@ class Trainer:
             `torch.optim.Optimizer`: The optimizer instance.
         """
         opt_model = self.model if model is None else model
+        # A new optimizer may carry different parameter group overrides, so validate them again.
+        self._per_param_group_grad_norms_validated = False
 
         if self.optimizer is None:
             decay_parameters = self.get_decay_parameter_names(opt_model)
@@ -1907,7 +1918,9 @@ class Trainer:
 
                 if do_sync_step:
                     grad_norm = None
-                    if self.args.max_grad_norm > 0:
+                    if self._has_per_param_group_grad_norm():
+                        grad_norm = self._clip_grad_norm_per_param_group(model)
+                    elif self.args.max_grad_norm > 0:
                         grad_norm = self._clip_grad_norm(model)
                     grad_norm = self._get_grad_norm(model, grad_norm=grad_norm)
 
@@ -2734,6 +2747,122 @@ class Trainer:
         if self._mixed_mesh_grads is None:
             self._mixed_mesh_grads = has_mixed_dtensor(p.grad for p in model.parameters() if p.grad is not None)
         return self._mixed_mesh_grads
+
+    def _has_per_param_group_grad_norm(self) -> bool:
+        """
+        Whether at least one optimizer parameter group sets its own `max_grad_norm`, opting into
+        per-group gradient clipping instead of global clipping.
+        """
+        return any(PARAM_GROUP_MAX_GRAD_NORM_KEY in group for group in self.optimizer.param_groups)
+
+    def _validate_per_param_group_grad_norms(self) -> None:
+        """
+        Validate per-group `max_grad_norm` overrides once, before the first optimizer step.
+
+        Backends that own gradient clipping themselves (DeepSpeed, SageMaker Model Parallel FP16,
+        XLA, FSDP1) cannot clip parameter groups independently and fail fast with a clear error.
+        """
+        if self._per_param_group_grad_norms_validated:
+            return
+        if self.is_deepspeed_enabled:
+            raise ValueError(
+                "Per-parameter-group `max_grad_norm` is not supported with DeepSpeed, which applies "
+                "gradient clipping globally inside its engine. Set `gradient_clipping` in the "
+                "DeepSpeed configuration and remove `max_grad_norm` from the optimizer parameter groups."
+            )
+        if is_sagemaker_mp_enabled() and self.args.fp16:
+            raise ValueError(
+                "Per-parameter-group `max_grad_norm` is not supported with SageMaker Model Parallel "
+                "FP16, where only the optimizer's global master-gradient clipping is available."
+            )
+        if self.accelerator.distributed_type == DistributedType.XLA:
+            raise ValueError(
+                "Per-parameter-group `max_grad_norm` is not supported on XLA devices, where gradient "
+                "reduction and clipping are performed globally."
+            )
+        if self.is_fsdp_enabled and getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) != 2:
+            raise ValueError(
+                "Per-parameter-group `max_grad_norm` requires FSDP2. FSDP1 flattens all parameters "
+                "into a single flat parameter, so groups cannot be clipped with independent norms."
+            )
+        for group_index, group in enumerate(self.optimizer.param_groups):
+            if PARAM_GROUP_MAX_GRAD_NORM_KEY not in group:
+                continue
+            value = group[PARAM_GROUP_MAX_GRAD_NORM_KEY]
+            valid = (
+                isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+            )
+            if not valid:
+                raise ValueError(
+                    f"Invalid `max_grad_norm` ({value!r}) in optimizer parameter group "
+                    f"{group_index}: expected a non-negative finite number. Set it to 0 to skip "
+                    "clipping for that group, or omit the key to fall back to "
+                    "`TrainingArguments.max_grad_norm`."
+                )
+        self._per_param_group_grad_norms_validated = True
+
+    def _clip_grad_norm_per_param_group(self, model):
+        """
+        Clip each optimizer parameter group independently using its own `max_grad_norm`.
+
+        A group without a `max_grad_norm` entry inherits `TrainingArguments.max_grad_norm`; a group
+        with `max_grad_norm=0` is not clipped. Only the parameters that received a gradient at this
+        step contribute to each group's norm, and the group's gradients are rescaled together by
+        `max_grad_norm / group_norm` only when the norm exceeds the cap.
+
+        Returns the combined pre-clipping norm over all groups, so callbacks and logs keep reporting
+        the same global `grad_norm` as the global clipping path.
+        """
+        self._validate_per_param_group_grad_norms()
+        # Unscale exactly once (a no-op outside fp16 AMP). Calling `accelerator.clip_grad_norm_`
+        # once per group would ask the GradScaler to unscale the same optimizer twice and raise.
+        self.accelerator.unscale_gradients()
+
+        from torch.nn.utils import clip_grads_with_norm_, get_total_norm
+
+        mixed_mesh = self._has_mixed_mesh_grads(model)
+        if mixed_mesh:
+            from torch.distributed.tensor import DTensor
+
+        # Bucket each group's grads by device mesh: norm ops cannot span DTensors that live on
+        # different meshes, so every (group, mesh) bucket gets its own reduced norm.
+        group_buckets = []
+        group_norms = []
+        max_norms = []
+        all_bucket_norms = []
+        for group in self.optimizer.param_groups:
+            buckets = defaultdict(list)
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                if mixed_mesh and isinstance(param.grad, DTensor):
+                    buckets[param.grad.device_mesh].append(param)
+                else:
+                    buckets[None].append(param)
+
+            bucket_norms = []
+            for params in buckets.values():
+                norm = get_total_norm([param.grad for param in params])
+                if mixed_mesh and isinstance(norm, DTensor):
+                    norm = norm.full_tensor()
+                bucket_norms.append(norm)
+
+            group_norm = torch.linalg.vector_norm(torch.stack(bucket_norms)) if bucket_norms else torch.zeros(())
+            group_buckets.append(buckets)
+            group_norms.append(group_norm)
+            max_norms.append(group.get(PARAM_GROUP_MAX_GRAD_NORM_KEY, self.args.max_grad_norm))
+            all_bucket_norms.extend(bucket_norms)
+
+        # Pre-clipping norm over all groups; identical to what global clipping would report.
+        total_norm = torch.linalg.vector_norm(torch.stack(all_bucket_norms)) if all_bucket_norms else torch.zeros(())
+
+        for buckets, group_norm, max_norm in zip(group_buckets, group_norms, max_norms):
+            if max_norm <= 0:
+                # 0 disables clipping for this group; its grads still count towards `total_norm`.
+                continue
+            for params in buckets.values():
+                clip_grads_with_norm_(params, max_norm, group_norm)
+        return total_norm
 
     def _clip_grad_norm(self, model):
         """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""

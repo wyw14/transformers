@@ -44,6 +44,7 @@ from transformers import (
     LlamaConfig,
     LlamaForCausalLM,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     default_data_collator,
     logging,
@@ -502,6 +503,184 @@ class TrainerGradientAccumulationTest(TestCasePlus, TrainerIntegrationCommon):
                     trainer.train()
 
                     self.assertEqual(len(trainer.get_train_dataloader()) * num_train_epochs, sum(total_batch_samples))
+
+
+# ---------------------------------------------------------------------------
+# Per-parameter-group gradient clipping tests
+# ---------------------------------------------------------------------------
+
+
+@require_torch
+class TrainerPerParamGroupGradNormTest(TestCasePlus):
+    """Per optimizer parameter group `max_grad_norm` overrides."""
+
+    dataset_len = 8
+    init_a = 4.0
+    init_b = 5.0
+
+    def _raw_grads(self):
+        """Reference gradients of one batch (the dataset fits in a single batch)."""
+        dataset = RegressionDataset(length=self.dataset_len)
+        model = RegressionModel(a=self.init_a, b=self.init_b)
+        x = torch.from_numpy(dataset.x)
+        y = torch.from_numpy(dataset.ys[0])
+        loss = nn.functional.mse_loss(model.a * x + model.b, y)
+        loss.backward()
+        return model.a.grad.clone(), model.b.grad.clone()
+
+    def _run_trainer(self, group_max_grad_norms, max_grad_norm=1.0, freeze=()):
+        """
+        Run one optimizer step with `group_max_grad_norms = {"max_grad_norm": value|None}` for each
+        of the two parameter groups (`a`, `b`); `None` means the key is omitted. Returns the
+        gradients captured right after clipping, the logged pre-clip `grad_norm`, the model and
+        whether the optimizer step callback fired.
+        """
+        model = RegressionModel(a=self.init_a, b=self.init_b)
+        if "a" in freeze:
+            model.a.requires_grad_(False)
+        if "b" in freeze:
+            model.b.requires_grad_(False)
+
+        groups = []
+        for name in ("a", "b"):
+            group = {"params": [getattr(model, name)]}
+            value = group_max_grad_norms[name]
+            if value is not None:
+                group["max_grad_norm"] = value
+            groups.append(group)
+        optimizer = torch.optim.SGD(groups, lr=0.1)
+
+        captured = {}
+
+        class ClipRecorder(TrainerCallback):
+            def on_pre_optimizer_step(self, args, state, control, **kwargs):
+                captured["a"] = model.a.grad.clone() if model.a.grad is not None else None
+                captured["b"] = model.b.grad.clone() if model.b.grad is not None else None
+
+            def on_optimizer_step(self, args, state, control, **kwargs):
+                captured["optimizer_step_called"] = True
+
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                if "grad_norm" in logs:
+                    captured["callback_grad_norm"] = logs["grad_norm"]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = TrainingArguments(
+                tmp_dir,
+                per_device_train_batch_size=self.dataset_len,
+                max_steps=1,
+                logging_steps=1,
+                report_to=[],
+                max_grad_norm=max_grad_norm,
+            )
+            trainer = Trainer(
+                model=model,
+                args=args,
+                train_dataset=RegressionDataset(length=self.dataset_len),
+                optimizers=(optimizer, None),
+                callbacks=[ClipRecorder()],
+            )
+            trainer.train()
+
+        logged = [h["grad_norm"] for h in trainer.state.log_history if "grad_norm" in h]
+        captured["logged_grad_norm"] = logged[0]
+        return captured, model, trainer
+
+    def test_independent_group_clipping_and_zero_skips_group(self):
+        raw_a, raw_b = self._raw_grads()
+        captured, _, _ = self._run_trainer({"a": 0.2, "b": 0.0})
+
+        # Group a is scaled to its own 0.2 cap; group b (max_grad_norm=0) is left untouched.
+        torch.testing.assert_close(captured["a"].abs(), torch.tensor(0.2), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(captured["a"], raw_a * (0.2 / raw_a.abs()), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(captured["b"], raw_b, atol=1e-6, rtol=1e-6)
+
+    def test_group_without_key_inherits_global_threshold(self):
+        raw_a, raw_b = self._raw_grads()
+        captured, _, _ = self._run_trainer({"a": 100.0, "b": None}, max_grad_norm=0.1)
+
+        # a's cap is high enough not to clip; b inherits the global 0.1 and is scaled on its own.
+        torch.testing.assert_close(captured["a"], raw_a, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(captured["b"], raw_b * (0.1 / raw_b.abs()), atol=1e-5, rtol=1e-5)
+
+    def test_zero_global_threshold_keeps_group_override(self):
+        raw_a, raw_b = self._raw_grads()
+        captured, _, _ = self._run_trainer({"a": 0.3, "b": None}, max_grad_norm=0.0)
+
+        # Global clipping disabled, but group a still clips at 0.3; b inherits 0 and is untouched.
+        torch.testing.assert_close(captured["a"], raw_a * (0.3 / raw_a.abs()), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(captured["b"], raw_b, atol=1e-6, rtol=1e-6)
+
+    def test_grad_norm_reports_combined_pre_clip_norm(self):
+        raw_a, raw_b = self._raw_grads()
+        combined_norm = torch.hypot(raw_a.abs(), raw_b.abs()).item()
+        captured, _, _ = self._run_trainer({"a": 0.2, "b": 0.0})
+
+        self.assertAlmostEqual(captured["logged_grad_norm"], combined_norm, delta=1e-4)
+        self.assertAlmostEqual(captured["callback_grad_norm"], combined_norm, delta=1e-4)
+
+    def test_group_without_grads_is_excluded(self):
+        _, raw_b = self._raw_grads()
+        # `a` receives no gradient this step: its group contributes nothing, and b clips against
+        # its own group norm rather than the combined norm.
+        captured, model, _ = self._run_trainer({"a": 0.05, "b": 0.3}, freeze=("a",))
+
+        self.assertIsNone(captured["a"])
+        torch.testing.assert_close(captured["b"], raw_b * (0.3 / raw_b.abs()), atol=1e-5, rtol=1e-5)
+        self.assertAlmostEqual(captured["logged_grad_norm"], raw_b.abs().item(), delta=1e-4)
+        self.assertTrue(model.a.requires_grad is False)
+
+    def test_global_clipping_unchanged_without_group_overrides(self):
+        raw_a, raw_b = self._raw_grads()
+        captured, _, trainer = self._run_trainer({"a": None, "b": None}, max_grad_norm=0.5)
+
+        self.assertFalse(trainer._has_per_param_group_grad_norm())
+        coef = min(1.0, 0.5 / torch.hypot(raw_a.abs(), raw_b.abs()).item())
+        torch.testing.assert_close(captured["a"], raw_a * coef, atol=2e-6, rtol=1e-6)
+        torch.testing.assert_close(captured["b"], raw_b * coef, atol=2e-6, rtol=1e-6)
+
+    def test_invalid_group_max_grad_norm_raises_before_optimizer_step(self):
+        for bad_value in (-0.1, float("nan"), float("inf"), "0.5", None, True):
+            with self.subTest(bad_value=bad_value):
+                model = RegressionModel(a=self.init_a, b=self.init_b)
+                params_before = (model.a.detach().clone(), model.b.detach().clone())
+                optimizer = torch.optim.SGD(
+                    [
+                        {"params": [model.a], "max_grad_norm": bad_value},
+                        {"params": [model.b]},
+                    ],
+                    lr=0.1,
+                )
+
+                class FailRecorder(TrainerCallback):
+                    def __init__(self):
+                        self.optimizer_step_called = False
+
+                    def on_optimizer_step(self, args, state, control, **kwargs):
+                        self.optimizer_step_called = True
+
+                recorder = FailRecorder()
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    args = TrainingArguments(
+                        tmp_dir,
+                        per_device_train_batch_size=self.dataset_len,
+                        max_steps=1,
+                        report_to=[],
+                    )
+                    trainer = Trainer(
+                        model=model,
+                        args=args,
+                        train_dataset=RegressionDataset(length=self.dataset_len),
+                        optimizers=(optimizer, None),
+                        callbacks=[recorder],
+                    )
+                    with self.assertRaises(ValueError):
+                        trainer.train()
+
+                # The error fires during clipping, before the first optimizer step: nothing was updated.
+                self.assertFalse(recorder.optimizer_step_called)
+                torch.testing.assert_close(model.a, params_before[0])
+                torch.testing.assert_close(model.b, params_before[1])
 
 
 # ---------------------------------------------------------------------------
